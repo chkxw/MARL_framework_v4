@@ -4,20 +4,17 @@ Agent Class for Genesis MARL Framework V4
 
 This module implements the Agent class which is the basic unit of interaction
 with the AEC environment. Agents handle communication with SubVecEnv instances
-and manage robot actions in the Genesis simulator.
+and manage robot actions through the simulator interface.
 """
 
+from typing import Any, Dict, List
+
 import torch
-import threading
-from typing import Dict, List, Optional, Any, Tuple
-from dataclasses import dataclass
 
-from genesis_logging import get_module_logger
-from configs import TrainingConfigBundle, JointTrainingBundle
-
-from genesis.engine.entities import RigidEntity
-
-logger = get_module_logger("agent")
+from configs.TrainingConfig import TrainingConfig
+from marl_logging import get_class_logger
+from model_inference import ModelInference
+from simulation_interface import RobotInterface
 
 
 class Agent:
@@ -28,82 +25,114 @@ class Agent:
 
     Key responsibilities:
     - Communicate with subVecEnv instances through semaphores
-    - Get actions from subVecEnv and apply them to Genesis simulator
-    - Handle two-layer control with localmotion models
-    - Batch localmotion inference for optimization
+    - Get actions from subVecEnv and apply them through simulator interface
+    - Handle two-layer control with locomotion models
+    - Batch locomotion inference for optimization
     """
 
     def __init__(
-        self, agent_name: str, frequency: float, training_config_bundles: List[TrainingConfigBundle], mother_env: Any
+        self, agent_name: str, frequency: float, training_configs: List[TrainingConfig], mother_env: Any
     ):  # Will be VectorizedAECEnv
         """Initialize Agent.
 
         Args:
             agent_name: Name of the agent (contains frequency info)
             frequency: Control frequency for this agent (Hz)
-            training_config_bundles: List of training bundles for this agent
+            training_configs: List of training bundles for this agent
             mother_env: Reference to the main AEC environment
         """
+        # Initialize independent class-specific logger
+        self.logger = get_class_logger("Agent", agent_name, level="INFO")
+
         self.agent_name = agent_name
         self.frequency = frequency
-        self.training_config_bundles = training_config_bundles
+        self.training_configs = training_configs
         self.mother_env = mother_env
+        self.coordinator = None
 
-        # References to subVecEnvs and semaphores
+        # References to subVecEnvs and coordinator
         self.subvecenvs: Dict[str, Any] = {}  # training_name -> subVecEnv
-        self.semaphores: Dict[str, threading.Semaphore] = {}  # training_name -> semaphore
-
-        self.motor_dofs_idx_locals: Dict[str, List[int]] = {}  # robot_name -> list of motor dof indexes
 
         # Robot mappings for this agent
-        self.robots: Dict[str, RigidEntity] = {}  # robot_name -> Robot Entity
+        self.robots: Dict[str, RobotInterface] = {}  # robot_name -> RobotInterface
         self.robot_names: List[str] = []  # List of robot names
         self.robot_configs: Dict[str, Any] = {}  # robot_name -> RobotConfig
 
-        # Localmotion model optimization
-        self.localmotion_models: Dict[str, Any] = {}  # path -> model instance
-        self.localmotion_groups: Dict[str, List[str]] = {}  # path -> list of robot names
+        # locomotion model optimization
+        self.locomotion_models: Dict[str, ModelInference] = {}  # path -> ModelInference instance
+        self.locomotion_groups: Dict[str, List[str]] = {}  # path -> list of robot names
 
-        logger.info(f"Initializing Agent {agent_name} at {frequency}Hz")
-        logger.info(f"  Training bundles: {[bundle.training_name for bundle in training_config_bundles]}")
+        self.logger.info(f"Initializing Agent {agent_name} at {frequency}Hz")
+        self.logger.info(f"  Training bundles: {[bundle.training_name for bundle in training_configs]}")
 
-        for bundle in self.training_config_bundles:
-            for robot_config in bundle.robot_configs:
-                robot_name = robot_config.name
+        for bundle in self.training_configs:
+            for robot_name, robot_config in bundle.robot_configs.items():
                 self.robot_names.append(robot_name)
                 self.robot_configs[robot_name] = robot_config
 
-                logger.debug(f"  Added robot {robot_name} to agent {self.agent_name}")
+        self._setup_locomotion_optimization()
 
-        self._setup_localmotion_optimization()
+        self.logger.debug(f"Agent {agent_name} initialization complete")
+        self.logger.debug(f"  Total robots: {len(self.robot_names)}")
+        self.logger.debug(f"  Robot names: {self.robot_names}")
 
-        logger.debug(f"Agent {agent_name} initialization complete")
-        logger.debug(f"  Total robots: {len(self.robot_names)}")
-        logger.debug(f"  Robot names: {self.robot_names}")
+    def set_coordinator(self, coordinator):
+        """Set the coordinator reference after initialization."""
+        self.coordinator = coordinator
+        self.logger.debug(f"Agent {self.agent_name} coordinator set")
 
-    def _setup_localmotion_optimization(self):
+    def _setup_locomotion_optimization(self):
         """
-        Setup localmotion model grouping for batch optimization.
+        Setup locomotion model grouping for batch optimization.
         Work on robot level
         """
-        # Group robots by localmotion model path for batch inference
-        localmotion_groups = {}
+        # Group robots by locomotion model path for batch inference
+        locomotion_groups = {}
 
         for robot_name, robot_config in self.robot_configs.items():
-            if robot_config.localmotion_path is not None:
-                path = robot_config.localmotion_path
-                if path not in localmotion_groups:
-                    localmotion_groups[path] = []
-                localmotion_groups[path].append(robot_name)
+            if robot_config.locomotion_path is not None:
+                path = robot_config.locomotion_path
+                if path not in locomotion_groups:
+                    locomotion_groups[path] = []
+                locomotion_groups[path].append(robot_name)
 
-        self.localmotion_groups = localmotion_groups
+        self.locomotion_groups = locomotion_groups
 
-        if localmotion_groups:
-            logger.info(f"Agent {self.agent_name} localmotion optimization groups:")
-            for path, robots in localmotion_groups.items():
-                logger.info(f"  {path}: {robots}")
+        if locomotion_groups:
+            self.logger.info(f"Agent {self.agent_name} locomotion optimization groups:")
+            for path, robots in locomotion_groups.items():
+                self.logger.info(f"  {path}: {robots}")
 
-        # TODO: Load localmotion models - either .onnx or .pt
+        # Load locomotion models
+        for locomotion_path in self.locomotion_groups.keys():
+
+            self.logger.info(f"Loading locomotion model: {locomotion_path}")
+
+            # Simple enhanced initialization
+            inference = ModelInference(force_cpu=False)
+            inference.load_model(locomotion_path)  # Auto-detects ONNX/PyTorch
+            self.logger.info(f"Loaded locomotion model: {locomotion_path}")
+
+            # Store the enhanced inference instance
+            self.locomotion_models[locomotion_path] = inference
+
+            robot_names = self.locomotion_groups[locomotion_path]
+            action_dim = self.robot_configs[robot_names[0]].action_space.shape[0]
+
+            sample_input = torch.randn(action_dim, dtype=torch.float32)
+            inference.record_performance_analysis(sample_input, max_batch_size=len(robot_names), verbose=False)
+
+            # Log optimization status
+            status = inference.get_performance_status()
+            self.logger.info(f"  Ultra-efficient optimization: {status['is_analyzed']}")
+            self.logger.info(f"  GPU beneficial types: {status['gpu_beneficial_types']}")
+            self.logger.info(f"  CPU-only types: {status['cpu_only_types']}")
+
+            for input_type, threshold in status['crossover_thresholds'].items():
+                if threshold == "never":
+                    self.logger.info(f"    {input_type}: CPU always optimal")
+                else:
+                    self.logger.info(f"    {input_type}: GPU optimal at batch >= {threshold}")
 
     def setup_robots(self):
         """Setup robots in the Genesis scene.
@@ -111,19 +140,25 @@ class Agent:
         This method is called by the AEC environment during initialization
         to add robots to the Genesis simulator.
         """
-        logger.info(f"Setting up robots for agent {self.agent_name}")
+        self.logger.info(f"Setting up robots for agent {self.agent_name}")
 
-        for training_bundle in self.training_config_bundles:
+        for training_bundle in self.training_configs:
             training_bundle.setup_function(self.mother_env)
 
-            for robot_cfg in training_bundle.robot_configs:
-                robot_name = robot_cfg.name
+            for robot_name, robot_cfg in training_bundle.robot_configs.items():
                 self.robots[robot_name] = self.mother_env.robots[robot_name]
+                robot_interface = self.robots[robot_name]
+
                 dofs_idx_local = []
                 for joint_name in robot_cfg.joint_names:
-                    dofs_idx_local.extend(self.robots[robot_name].get_joint(joint_name).dofs_idx_local)
+                    joint_new = robot_interface.get_joint(joint_name)
+                    dofs_idx_local_new = joint_new.dofs_idx_local
 
-                self.motor_dofs_idx_locals[robot_name] = torch.tensor(dofs_idx_local, device=self.mother_env.device)
+                    dofs_idx_local.extend(dofs_idx_local_new)
+
+                self.mother_env.joint_dofs_idx_locals[robot_name] = torch.tensor(
+                    dofs_idx_local, device=self.mother_env.device
+                )
 
     def _setup_robot_dp_parameters(self, robot_name):
         """Setup DP (Differential Position) parameters for robot control.
@@ -135,14 +170,13 @@ class Agent:
             robot_config: RobotConfig with DP parameters
         """
 
-        robot, robot_config = self.mother_env.robots[robot_name], self.robot_configs[robot_name]
+        robot_interface, robot_config = self.mother_env.robots[robot_name], self.robot_configs[robot_name]
 
-        # Set PD control gains for all DOFs
-        if hasattr(robot, 'set_dofs_kp') and hasattr(robot, 'set_dofs_kv'):
-            robot.set_dofs_kp(robot_config.DP_kp, dofs_idx_local=self.motor_dofs_idx_locals[robot_name])
-            robot.set_dofs_kv(robot_config.DP_kd, dofs_idx_local=self.motor_dofs_idx_locals[robot_name])
-        else:
-            logger.warning(f"Robot {robot_config.name} does not support PD control parameter setting")
+        # Set PD control gains for all DOFs using both old and new interfaces for validation
+        joint_indices = self.mother_env.joint_dofs_idx_locals[robot_name]
+
+        robot_interface.set_kp_gains(robot_config.DP_kp, joint_indices=joint_indices)
+        robot_interface.set_kd_gains(robot_config.DP_kd, joint_indices=joint_indices)
 
     def _reset_robots(self, env_indices: torch.Tensor):
         """Reset robots in specified environments.
@@ -150,69 +184,66 @@ class Agent:
         Args:
             env_indices: Tensor of environment indices to reset
         """
-        logger.debug(f"Agent {self.agent_name} resetting envs: {env_indices.tolist()}")
+        self.logger.debug(f"Agent {self.agent_name} resetting envs: {env_indices.tolist()}")
 
         for robot_name in self.robot_names:
-            robot = self.mother_env.robots[robot_name]
+            robot_interface = self.mother_env.robots[robot_name]
             robot_config = self.robot_configs[robot_name]
 
-            # TODO allow more options for initial pos / velocity / joint values
-            n_dofs = robot.get_dofs_position().shape[1]
-            initial_joint_pos = torch.zeros(n_dofs, device=env_indices.device, dtype=torch.float32)
+            # Use the configured default joint positions for controllable joints only
+            initial_joint_pos = torch.tensor(
+                robot_config.initial_joint_pos, device=env_indices.device, dtype=torch.float32
+            )
+            initial_joint_vel = torch.tensor(
+                robot_config.initial_joint_vel, device=env_indices.device, dtype=torch.float32
+            )
             initial_joint_pos_expanded = initial_joint_pos.unsqueeze(0).expand(len(env_indices), -1)
+            initial_joint_vel_expanded = initial_joint_vel.unsqueeze(0).expand(len(env_indices), -1)
 
-            robot.set_dofs_position(initial_joint_pos_expanded, envs_idx=env_indices, zero_velocity=True)
+            joint_indices = self.mother_env.joint_dofs_idx_locals[robot_name]
+
+            robot_interface.set_joint_pos(
+                initial_joint_pos_expanded,
+                joint_indices=joint_indices,
+                env_indices=env_indices,
+                zero_velocity=True,
+            )
+            robot_interface.set_joint_vel(
+                initial_joint_vel_expanded,
+                joint_indices=joint_indices,
+                env_indices=env_indices,
+            )
 
             initial_pos = torch.tensor(robot_config.initial_position, device=env_indices.device, dtype=torch.float32)
             initial_quat = torch.tensor(
                 robot_config.initial_orientation, device=env_indices.device, dtype=torch.float32
             )
+            initial_vel = torch.tensor(robot_config.initial_velocity, device=env_indices.device, dtype=torch.float32)
+            initial_ang_vel = torch.tensor(
+                robot_config.initial_angular_velocity, device=env_indices.device, dtype=torch.float32
+            )
 
             # Expand to match environment indices
             initial_pos_expanded = initial_pos.unsqueeze(0).expand(len(env_indices), -1)
             initial_quat_expanded = initial_quat.unsqueeze(0).expand(len(env_indices), -1)
+            initial_vel_expanded = initial_vel.unsqueeze(0).expand(len(env_indices), -1)
+            initial_ang_vel_expanded = initial_ang_vel.unsqueeze(0).expand(len(env_indices), -1)
 
-            # Reset robot to initial position/orientation
-            robot.set_pos(initial_pos_expanded, envs_idx=env_indices)
-            robot.set_quat(initial_quat_expanded, envs_idx=env_indices)
+            # Reset robot to initial position/orientation using both old and new interfaces
+            robot_interface.set_pos(initial_pos_expanded, env_indices=env_indices)
+            robot_interface.set_orientation(initial_quat_expanded, env_indices=env_indices)
 
-            logger.debug(f"  Reset robot {robot_name} in envs {env_indices.tolist()}")
+            # Check if vel and angular vel should be set (All 0 means no need to be set)
+            no_need_to_set_vel = torch.allclose(initial_vel, torch.zeros_like(initial_vel))
+            no_need_to_set_ang_vel = torch.allclose(initial_ang_vel, torch.zeros_like(initial_ang_vel))
+            if not (no_need_to_set_vel and no_need_to_set_ang_vel):
+                robot_interface.set_lin_vel(initial_vel_expanded, env_indices=env_indices)
+                robot_interface.set_ang_vel(initial_ang_vel_expanded, env_indices=env_indices)
 
-    def step(self):
-        """Execute one step of the agent.
+            self.logger.debug(f"  Reset robot {robot_name} in envs {env_indices.tolist()}")
 
-        1. Get actions from all subVecEnvs (wait if not available)
-        2. Split actions per robot if needed
-        3. Apply localmotion if configured
-        4. Apply actions to Genesis simulator
-        """
-        logger.debug(f"Agent {self.agent_name} stepping")
-
-        # 1. Wait for actions from all subVecEnvs
-        self.wait_subvecenvs()
-
-        robot_actions = {self.mother_env.action_buffers[robot_name] for robot_name in self.robot_names}
-
-        # 3. Apply localmotion models if configured
-        joint_actions = self._apply_localmotion_models(robot_actions)
-
-        # 4. Apply joint actions to Genesis simulator
-        for robot_name, joint_action in joint_actions.items():
-            robot = self.robots[robot_name]
-            robot_config = self.robot_configs[robot_name]
-
-            # Scale actions
-            scaled_action = joint_action * robot_config.action_scale
-
-            # Apply to simulator based on control mode
-            self._apply_robot_action(robot, robot_config, scaled_action)
-
-            logger.debug(f"Applied action to robot {robot_name}: shape {scaled_action.shape}")
-
-        logger.debug(f"Agent {self.agent_name} step complete")
-
-    def _apply_localmotion_models(self, robot_actions: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Apply localmotion models to convert high-level actions to joint values.
+    def _apply_locomotion_models(self, robot_actions: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Apply locomotion models to convert high-level actions to joint values.
 
         Args:
             robot_actions: Dictionary mapping robot_name -> action tensor
@@ -220,40 +251,43 @@ class Agent:
         Returns:
             Dictionary mapping robot_name -> joint_action tensor
         """
-
-        # TODO: haven't check yet
         joint_actions = {}
+        n_envs = self.mother_env.n_envs
 
-        # Process robots with localmotion models in batches
-        for localmotion_path, robot_names in self.localmotion_groups.items():
-            if localmotion_path in self.localmotion_models:
-                # Batch inference for efficiency
-                model = self.localmotion_models[localmotion_path]
+        # Process robots with locomotion models in batches
+        for locomotion_path, robot_names in self.locomotion_groups.items():
+            # Batch inference for efficiency
+            inference = self.locomotion_models[locomotion_path]
 
-                # Collect actions for this group
-                group_actions = []
-                for robot_name in robot_names:
-                    group_actions.append(robot_actions[robot_name])
+            # Collect actions for this group
+            group_actions = []
+            for robot_name in robot_names:
+                n_envs_action = robot_actions[robot_name]
+                # Reshape to (n_envs, actions...)
+                group_actions.append(n_envs_action.view(n_envs_action.shape[0], -1))
 
-                # Batch inference
-                batched_actions = torch.cat(group_actions, dim=0)
-                batched_joint_actions = model.inference(batched_actions)
+            # Use n_envs dim as batch dim, stack actions from all robots
+            batched_actions = torch.cat(group_actions, dim=0)
 
-                # Split results back to individual robots
-                start_idx = 0
-                for robot_name in robot_names:
-                    n_envs = robot_actions[robot_name].shape[0]
-                    end_idx = start_idx + n_envs
-                    joint_actions[robot_name] = batched_joint_actions[start_idx:end_idx]
-                    start_idx = end_idx
+            # Universal inference with automatic GPU/CPU optimization
+            batched_joint_actions = inference.predict(batched_actions)
 
-                logger.debug(f"Applied localmotion model {localmotion_path} to robots {robot_names}")
+            # Dispatch inferred actions to individual robots
+            split_joint_actions = torch.split(batched_joint_actions, n_envs, dim=0)
+            for i, robot_name in enumerate(robot_names):
+                self.mother_env.joint_action_buffers[robot_name] = split_joint_actions[i]
+                joint_actions[robot_name] = split_joint_actions[i]
 
-        # For robots without localmotion, actions are already joint values
+        # For robots without locomotion, actions are already joint values
         for robot_name in self.robot_names:
             if robot_name not in joint_actions:
+                self.mother_env.joint_action_buffers[robot_name] = robot_actions[robot_name]
                 joint_actions[robot_name] = robot_actions[robot_name]
 
+        # Check if there's nan value in joint actions
+        for robot_name, joint_action in joint_actions.items():
+            if torch.isnan(joint_action).any():
+                self.logger.warning(f"NaN value detected in joint actions for robot {robot_name}")
         return joint_actions
 
     def _apply_robot_action(self, robot_name, action: torch.Tensor):
@@ -265,72 +299,58 @@ class Agent:
             action: Joint action tensor [n_envs, n_joints]
         """
         robot_config = self.robot_configs[robot_name]
-        robot = self.robots[robot_name]
+        robot_interface = self.robots[robot_name]
 
         control_mode = robot_config.control_mode
-        logger.debug(f"Applying {control_mode} action to robot {robot_config.name}, shape: {action.shape}")
+        self.logger.debug(f"Applying {control_mode} action to robot {robot_config.name}, shape: {action.shape}")
 
-        dofs_idx_local = self.motor_dofs_idx_locals[robot_name]
+        dofs_idx_local = self.mother_env.joint_dofs_idx_locals[robot_name]
 
         if len(dofs_idx_local) != action.shape[1]:
-            logger.warning(
+            self.logger.warning(
                 f"Robot {robot_config.name} has {len(dofs_idx_local)} DOFs but action has {action.shape[1]} DOFs"
             )
 
+        # Apply control using both old and new interfaces for validation
         if control_mode == "position":
-            robot.control_dofs_position(position=action, dofs_idx_local=dofs_idx_local)
+            robot_interface.control_joint_pos(target_pos=action, joint_indices=dofs_idx_local)
         elif control_mode == "velocity":
-            robot.control_dofs_velocity(velocity=action, dofs_idx_local=dofs_idx_local)
+            robot_interface.control_joint_vel(target_vel=action, joint_indices=dofs_idx_local)
         elif control_mode == "force":
-            robot.control_dofs_force(force=action, dofs_idx_local=dofs_idx_local)
+            robot_interface.control_joint_force(forces=action, joint_indices=dofs_idx_local)
         else:
             raise ValueError(f"Unknown control mode: {control_mode}")
 
-    def last(self):
-        """Send observations/rewards/terminations/truncations/info to subVecEnvs.
+    def _wait_for_actions(self):
+        """Wait for all subVecEnvs to provide actions."""
+        if self.coordinator is None:
+            raise RuntimeError(f"Agent {self.agent_name} coordinator not set")
 
-        Args:
-            dont_send: If True, don't set semaphores (used for initial setup)
-        """
-        logger.debug(f"Agent {self.agent_name} last() called")
+        # Get list of training states we need to wait for
+        training_states = [bundle.training_name for bundle in self.training_configs]
 
-        # Move data from AEC's buffers to subVecEnv buffers
-        for training_cfg in self.training_config_bundles:
-            training_name = training_cfg.training_name
-            subvecenv = self.subvecenvs[training_name]
+        self.logger.debug(f"Agent {self.agent_name} waiting for actions from: {training_states}")
 
-            for i, robot_cfg in enumerate(training_cfg.robot_configs):
-                subvecenv.obs_buffer[robot_cfg.name] = self.mother_env.observations[robot_cfg.name]
-                subvecenv.rew_buffer[robot_cfg.name] = self.mother_env._cumulative_rewards[robot_cfg.name]
-                subvecenv.term_buffer[robot_cfg.name] = self.mother_env.terminations[robot_cfg.name]
-                subvecenv.trunc_buffer[robot_cfg.name] = self.mother_env.truncations[robot_cfg.name]
-                subvecenv.info_buffer[robot_cfg.name] = self.mother_env.infos[robot_cfg.name]
+        # Wait for all training states to finish providing actions
+        self.coordinator.wait(training_states)
 
-                if i == 0 and isinstance(training_cfg, JointTrainingBundle):
-                    break  # Only first robot in bundle has valid obs/rew/term/trunc/info
+        self.logger.debug(f"Agent {self.agent_name} received all actions")
 
-        # Notify subVecEnvs that data is ready
-        self.notify_subvecenvs()
+    def _notify_data_ready(self):
+        """Notify all subVecEnvs that observation/reward data is ready."""
+        if self.coordinator is None:
+            raise RuntimeError(f"Agent {self.agent_name} coordinator not set")
 
-        logger.debug(f"Agent {self.agent_name} last() complete")
+        # Get list of training states to wake up
+        training_states = [training_cfg.training_name for training_cfg in self.training_configs]
 
-    def wait_subvecenvs(self):
-        """Wait for all subVecEnv semaphores to be 1 (actions ready)."""
-        logger.debug(f"Agent {self.agent_name} waiting for subVecEnvs")
+        self.logger.debug(f"Agent {self.agent_name} notifying data ready to: {training_states} subVecEnvs")
 
-        for training_name in [bundle.training_name for bundle in self.training_config_bundles]:
-            semaphore = self.semaphores[training_name]
-            semaphore.acquire()  # Wait for semaphore to be 1
-            logger.debug(f"  Received signal from {training_name}")
+        # Reset finished flags and wake up training threads
+        self.coordinator.set_unfinished(training_states)
+        self.coordinator.wake(training_states)
 
-    def notify_subvecenvs(self):
-        """Set all subVecEnv semaphores to 0 (data ready)."""
-        logger.debug(f"Agent {self.agent_name} notifying subVecEnvs")
-
-        for training_name in [bundle.training_name for bundle in self.training_config_bundles]:
-            semaphore = self.semaphores[training_name]
-            semaphore.release()  # Set semaphore to 0
-            logger.debug(f"  Notified {training_name}")
+        self.logger.debug(f"Agent {self.agent_name} notification complete")
 
 
 if __name__ == "__main__":

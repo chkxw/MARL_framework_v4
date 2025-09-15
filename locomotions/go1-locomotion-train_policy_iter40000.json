@@ -1,0 +1,170 @@
+{
+  "model_info": {
+    "name": "Go1 Quadruped Locomotion Policy",
+    "robot": "Go1",
+    "framework": "Genesis",
+    "experiment_name": "go1-locomotion-train",
+    "training_iterations": 40000,
+    "model_type": "quadruped_locomotion_policy"
+  },
+  "architecture": {
+    "type": "MLP",
+    "input_dimension": 45,
+    "output_dimension": 12,
+    "hidden_dimensions": [
+      512,
+      256,
+      128
+    ],
+    "activation": "elu",
+    "layer_structure": "45 \u2192 512 \u2192 256 \u2192 128 \u2192 12"
+  },
+  "observation_space": {
+    "total_dimensions": 45,
+    "components": [
+      {
+        "name": "Angular Velocity",
+        "indices": "[0:3]",
+        "dimensions": 3,
+        "description": "Base angular velocity in robot frame (roll, pitch, yaw)",
+        "units": "rad/s",
+        "scaling_factor": 0.25
+      },
+      {
+        "name": "Projected Gravity",
+        "indices": "[3:6]",
+        "dimensions": 3,
+        "description": "Gravity vector projected into robot frame (for orientation)",
+        "units": "unit vector",
+        "scaling_factor": 1.0
+      },
+      {
+        "name": "Command Velocities",
+        "indices": "[6:9]",
+        "dimensions": 3,
+        "description": "Desired velocities: [vx, vy, yaw_rate]",
+        "units": "m/s, rad/s",
+        "scaling_factor": 2.0
+      },
+      {
+        "name": "Joint Positions",
+        "indices": "[9:21]",
+        "dimensions": 12,
+        "description": "Current joint angles relative to default pose",
+        "units": "rad",
+        "scaling_factor": 1.0
+      },
+      {
+        "name": "Joint Velocities",
+        "indices": "[21:33]",
+        "dimensions": 12,
+        "description": "Current joint angular velocities",
+        "units": "rad/s",
+        "scaling_factor": 0.05
+      },
+      {
+        "name": "Previous Actions",
+        "indices": "[33:45]",
+        "dimensions": 12,
+        "description": "Previous motor commands (for temporal consistency)",
+        "units": "rad",
+        "scaling_factor": 1.0
+      }
+    ]
+  },
+  "action_space": {
+    "dimensions": 12,
+    "description": "Motor position commands (rad) relative to default pose",
+    "scaling": {
+      "action_scale": 0.25,
+      "formula": "target_pos = action * 0.25 + default_pose"
+    },
+    "std_values": [
+      1.2916396856307983,
+      1.2990038394927979,
+      1.3070688247680664,
+      1.2734322547912598,
+      1.31106698513031,
+      1.335856318473816,
+      1.2945853471755981,
+      1.3620083332061768,
+      1.3509622812271118,
+      1.2906560897827148,
+      1.3682966232299805,
+      1.3674153089523315
+    ]
+  },
+  "joint_configuration": {
+    "joint_order": [
+      "FR_hip",
+      "FR_thigh",
+      "FR_calf",
+      "FL_hip",
+      "FL_thigh",
+      "FL_calf",
+      "RR_hip",
+      "RR_thigh",
+      "RR_calf",
+      "RL_hip",
+      "RL_thigh",
+      "RL_calf"
+    ],
+    "default_angles": {
+      "description": "Default joint angles in radians",
+      "hip_joints": {
+        "FR": 0.0,
+        "FL": 0.0,
+        "RR": 0.0,
+        "RL": 0.0
+      },
+      "thigh_joints": {
+        "FR": 0.8,
+        "FL": 0.8,
+        "RR": 1.0,
+        "RL": 1.0
+      },
+      "calf_joints": {
+        "FR": -1.5,
+        "FL": -1.5,
+        "RR": -1.5,
+        "RL": -1.5
+      }
+    }
+  },
+  "control_parameters": {
+    "pd_gains": {
+      "kp": 20.0,
+      "kd": 0.5
+    },
+    "control_frequency": "50Hz",
+    "timestep": 0.02,
+    "action_latency": "1 step (simulated)"
+  },
+  "usage": {
+    "onnx": {
+      "load": "onnxruntime.InferenceSession('model.onnx')",
+      "input_name": "observation",
+      "output_name": "action_mean",
+      "input_shape": [
+        1,
+        45
+      ],
+      "output_shape": [
+        1,
+        12
+      ]
+    },
+    "torchscript": {
+      "load": "torch.jit.load('model.pt')",
+      "input_shape": [
+        1,
+        45
+      ],
+      "output_shape": [
+        1,
+        12
+      ],
+      "has_embedded_std": true
+    }
+  }
+}

@@ -6,6 +6,7 @@ imgui.ini
 sftp-config.json
 *.mp4
 genesis/assets/terrain/
+exported_models/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -148,3 +149,8 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# ignore python hooks
+.claude
+.bmad-core
+.notification_hooks
