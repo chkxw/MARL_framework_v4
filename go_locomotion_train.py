@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Go1 MARL Training Script using Genesis MARL Framework V4
+Unified Go1/Go2 MARL Training Script using Genesis MARL Framework V4
 
-This script replicates the original go1_rsl_rl_training functionality using
+This script replicates the original go1/go_rsl_rl_training functionality using
 the new Genesis MARL framework architecture. It demonstrates how to create
-equivalent Go1 locomotion training using the VectorizedAECEnv approach.
+equivalent Go1 or Go2 locomotion training using the VectorizedAECEnv approach.
 """
 
 import argparse
@@ -20,6 +20,7 @@ import genesis as gs
 import torch
 from utils import inv_quat, quat_to_xyz, transform_by_quat, transform_quat_by_quat
 
+from configs.SimulatorConfig import SimulatorConfig
 from configs.RobotConfig import RobotConfig
 from marl_logging import get_class_logger
 from rsl_rl.runners import OnPolicyRunner
@@ -37,7 +38,7 @@ from vectorized_aec_env import VectorizedAECEnv
 from configs.CameraConfig import CameraConfig
 
 
-# Go1 configuration parameters (adapted from Go2 config)
+# Go1/Go2 configuration parameters (from original training scripts)
 env_cfg = {
     "num_actions": 12,
     "default_joint_angles": {  # [rad]
@@ -113,17 +114,29 @@ command_cfg = {
 }
 
 
-def create_go1_robot_config(name: str = "go1_robot") -> RobotConfig:
-    """Create a Go1 robot configuration with proper obs/reward/termination functions.
+def create_go_robot_config(name: str, robot_type: str = "go2", frequency: int = 50) -> RobotConfig:
+    """Create a Go1/Go2 robot configuration with proper obs/reward/termination functions.
 
-    This replicates the functionality from the original go1_env.py but in a functional
+    This replicates the functionality from the original go1/go_env.py but in a functional
     approach compatible with the Genesis MARL framework.
+
+    Args:
+        name: Name of the robot
+        robot_type: Either "go1" or "go2"
     """
 
-    def go1_setup_function(robot_name, env):
-        """Setup function for Go1 robot."""
+    # Set URDF path based on robot type
+    if robot_type == "go1":
+        urdf_path = "go1_standalone/urdf/go1.urdf"
+    elif robot_type == "go2":
+        urdf_path = "go2_standalone/urdf/go2.urdf"
+    else:
+        raise ValueError(f"Unknown robot type: {robot_type}. Must be 'go1' or 'go2'")
+
+    def go_setup_function(robot_name, env):
+        """Setup function for Go robot."""
         robot_cfg = env.robot_configs[robot_name]
-        # Use the Go1 URDF path
+        # Use the robot's URDF path
         robot = env.scene.add_robot(
             name=robot_name,
             urdf_path=robot_cfg.urdf_path,
@@ -176,7 +189,7 @@ def create_go1_robot_config(name: str = "go1_robot") -> RobotConfig:
 
         return robot
 
-    def go1_pre_reset_hook(env, env_indices):
+    def go_pre_reset_hook(env, env_indices):
         # We cannot write to infos directly, since info will be clear during reset, we need to do it after reset
 
         if "episode" not in env.infos:
@@ -187,7 +200,7 @@ def create_go1_robot_config(name: str = "go1_robot") -> RobotConfig:
             env.infos[name]["episode"][key] = mean
             tensor.zero_()
 
-    def go1_post_reset_hook(env, env_indices):
+    def go_post_reset_hook(env, env_indices):
         if hasattr(env, '_commands') and name in env._commands:
             env._commands[name][env_indices, 0] = gs_rand_float(
                 *command_cfg["lin_vel_x_range"], (len(env_indices),), env.device
@@ -199,7 +212,7 @@ def create_go1_robot_config(name: str = "go1_robot") -> RobotConfig:
                 *command_cfg["ang_vel_range"], (len(env_indices),), env.device
             )
 
-    def go1_post_step_hook(env):
+    def go_post_step_hook(env):
         """Calculate all intermediates"""
         # Resample commands every resampling_time_s using existing episode_frame_count
         # Convert episode frames to robot control steps (episode_frame_count is at simulation frequency)
@@ -220,8 +233,8 @@ def create_go1_robot_config(name: str = "go1_robot") -> RobotConfig:
                 *command_cfg["ang_vel_range"], (len(envs_to_resample),), env.device
             )
 
-    def go1_obs_function(env) -> torch.Tensor:
-        """Go1 observation function - 45 dimensional observation."""
+    def go_obs_function(env) -> torch.Tensor:
+        """Go observation function - 45 dimensional observation."""
         robot_interface = env.robots[name]
         robot_config = env.robot_configs[name]
         n_envs = env.n_envs
@@ -292,8 +305,8 @@ def create_go1_robot_config(name: str = "go1_robot") -> RobotConfig:
 
         return obs
 
-    def go1_reward_function(env) -> Dict[str, torch.Tensor]:
-        """Go1 reward function - implements all reward components from original."""
+    def go_reward_function(env) -> Dict[str, torch.Tensor]:
+        """Go reward function - implements all reward components from original."""
         robot_interface = env.robots[name]
         robot_cfg = env.robot_configs[name]
         n_envs = env.n_envs
@@ -409,8 +422,8 @@ def create_go1_robot_config(name: str = "go1_robot") -> RobotConfig:
 
         return {name: total_reward}
 
-    def go1_truncation_function(env) -> torch.Tensor:
-        """Go1 truncation function - robot falls or episode time exceeded."""
+    def go_truncation_function(env) -> torch.Tensor:
+        """Go truncation function - robot falls or episode time exceeded."""
         robot_interface = env.robots[name]
 
         base_quat = robot_interface.get_orientation(format="quat")
@@ -442,14 +455,14 @@ def create_go1_robot_config(name: str = "go1_robot") -> RobotConfig:
 
         return truncated
 
-    def go1_info_function(env) -> Dict[str, Any]:
-        """Go1 info function - provides episode statistics and critic observations."""
+    def go_info_function(env) -> Dict[str, Any]:
+        """Go info function - provides episode statistics and critic observations."""
 
-        # No specific info for Go1 training
+        # No specific info for Go2 training
         return {}
 
-    def go1_action_preprocessing_function(env):
-        """Go1 action preprocessing function with proper action latency simulation."""
+    def go_action_preprocessing_function(env):
+        """Go action preprocessing function with proper action latency simulation."""
         # Get current action from action buffer
         action = env.action_buffers[name].clone()
 
@@ -490,23 +503,23 @@ def create_go1_robot_config(name: str = "go1_robot") -> RobotConfig:
     # Create robot config
     config = RobotConfig(
         name=name,
-        urdf_path="go1_standalone/urdf/go1.urdf",
-        frequency=50,  # 50 Hz control frequency
+        urdf_path=urdf_path,
+        frequency=frequency,  # Configurable control frequency
         initial_position=env_cfg["base_init_pos"],
         initial_orientation=env_cfg["base_init_quat"],
-        action_space=None,  # Auto-detect from Go1 joints (12 actions)
+        action_space=None,  # Auto-detect from robot joints (12 actions)
         observation_space=None,  # Will be 45D as calculated
         control_mode="position",
         joint_names=env_cfg["joint_names"],
-        pre_reset_hook=go1_pre_reset_hook,
-        post_reset_hook=go1_post_reset_hook,
-        post_step_hook=go1_post_step_hook,
-        obs_function=go1_obs_function,
-        reward_function=go1_reward_function,
-        truncation_function=go1_truncation_function,
-        info_function=go1_info_function,
-        setup_function=go1_setup_function,
-        action_preprocessing_function=go1_action_preprocessing_function,  # Add action preprocessing
+        pre_reset_hook=go_pre_reset_hook,
+        post_reset_hook=go_post_reset_hook,
+        post_step_hook=go_post_step_hook,
+        obs_function=go_obs_function,
+        reward_function=go_reward_function,
+        truncation_function=go_truncation_function,
+        info_function=go_info_function,
+        setup_function=go_setup_function,
+        action_preprocessing_function=go_action_preprocessing_function,  # Add action preprocessing
         initial_joint_pos=initial_joint_pos,  # Add default joint positions
         DP_kp=env_cfg["kp"],
         DP_kd=env_cfg["kd"],
@@ -515,8 +528,8 @@ def create_go1_robot_config(name: str = "go1_robot") -> RobotConfig:
     return config
 
 
-def get_go1_train_cfg(exp_name: str, max_iterations: int) -> RSL_RLConfig:
-    """Get RSL_RL training configuration matching original go1_train.py."""
+def get_go_train_cfg(exp_name: str, max_iterations: int) -> RSL_RLConfig:
+    """Get RSL_RL training configuration matching original go1/go2_train.py."""
     alg_config = AlgorithmConfig(
         class_name="PPO",
         clip_param=0.2,
@@ -567,33 +580,44 @@ def get_go1_train_cfg(exp_name: str, max_iterations: int) -> RSL_RLConfig:
 def main():
     """Main training function."""
     # Setup main script logger
-    logger = get_class_logger("TrainingScript", "go1_locomotion", level="INFO")
+    logger = get_class_logger("TrainingScript", "go_locomotion", level="INFO")
 
-    parser = argparse.ArgumentParser(description="Go1 MARL Training with Genesis Framework")
-    parser.add_argument("-e", "--exp_name", type=str, default="go1-locomotion-train", help="Experiment name")
+    parser = argparse.ArgumentParser(description="Go1/Go2 MARL Training with Genesis Framework")
+    parser.add_argument("-r", "--robot", type=str, default="go1", choices=["go1", "go2"], help="Robot type to train")
+    parser.add_argument("-e", "--exp_name", type=str, default=None, help="Experiment name")
     parser.add_argument("-B", "--num_envs", type=int, default=4096, help="Number of parallel environments")
     parser.add_argument("--max_iterations", type=int, default=101, help="Maximum training iterations")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument("--frequency", type=int, default=50, help="Robot control frequency in Hz (default: 50)")
+    parser.add_argument("--render", action="store_true",
+                        help="Enable real-time rendering. This will slow down training but allows visual inspection")
     parser.add_argument("--enable_camera", action="store_true", help="Enable periodic video recording")
     parser.add_argument("--camera_interval", type=int, default=150, help="Recording interval in seconds")
     parser.add_argument("--camera_duration", type=int, default=30, help="Recording duration in seconds")
     parser.add_argument("--camera_res", type=str, default="1280x720", help="Camera resolution (WxH)")
     args = parser.parse_args()
 
-    logger.info("🤖 Starting Go1 MARL Training")
+    # Set default experiment name based on robot type if not provided
+    if args.exp_name is None:
+        args.exp_name = f"{args.robot}-locomotion-train"
+
+    logger.info(f"🤖 Starting {args.robot.upper()} MARL Training")
+    logger.info(f"  Robot: {args.robot}")
     logger.info(f"  Experiment: {args.exp_name}")
     logger.info(f"  Environments: {args.num_envs}")
     logger.info(f"  Iterations: {args.max_iterations}")
+    logger.info(f"  Control frequency: {args.frequency} Hz")
     logger.info(f"  Seed: {args.seed if args.seed is not None else 'None (random)'}")
+    logger.info(f"  Real-time rendering: {args.render}")
     logger.info(f"  Periodic recording: {args.enable_camera}")
     if args.enable_camera:
         logger.info(f"  Camera resolution: {args.camera_res}")
         logger.info(f"  Recording interval: {args.camera_interval}s")
         logger.info(f"  Recording duration: {args.camera_duration}s")
 
-    # Step 1: Create Go1 robot configuration
-    logger.info("Step 1: Creating Go1 robot configuration...")
-    robot_config = create_go1_robot_config("go1_robot")
+    # Step 1: Create robot configuration based on robot type
+    logger.info(f"Step 1: Creating {args.robot.upper()} robot configuration...")
+    robot_config = create_go_robot_config(f"{args.robot}_robot", robot_type=args.robot, frequency=args.frequency)
 
     # Step 1.5: Create camera configuration
     camera_config = None
@@ -612,7 +636,7 @@ def main():
 
     # Step 2: Create training bundle
     logger.info("Step 2: Creating single robot training bundle...")
-    rsl_rl_cfg = get_go1_train_cfg(args.exp_name, args.max_iterations)
+    rsl_rl_cfg = get_go_train_cfg(args.exp_name, args.max_iterations)
     training_config = RSL_RLTrainingConfig(
         training_name=args.exp_name,
         robot_cfgs=[robot_config],
@@ -630,9 +654,15 @@ def main():
             training_configs=[training_config],
             n_envs=args.num_envs,
             max_episode_length_s=env_cfg["episode_length_s"],
-            render=False,  # Always headless for training
+            render=args.render,  # Use command-line option
             seed=args.seed,
             camera_configs=camera_configs,
+            simulator_config=SimulatorConfig(
+                show_viewer=args.render,
+                dt=1.0 / args.frequency,
+                n_envs=args.num_envs,
+                device="cuda" if torch.cuda.is_available() else "cpu"
+            ),
         )
         logger.info("✅ VectorizedAECEnv created successfully")
     except Exception as e:
@@ -667,10 +697,10 @@ def main():
 
     # Calculate total simulation time needed
     # RSL_RL will run max_iterations * num_steps_per_env steps
-    # With 50Hz robot frequency, we need enough simulation time
+    # With configurable robot frequency, we need enough simulation time
     rsl_rl_cfg = training_config.rsl_rl_config
     total_steps_needed = args.max_iterations * rsl_rl_cfg.num_steps_per_env
-    total_sim_time = total_steps_needed / 50  # 50Hz robot frequency
+    total_sim_time = total_steps_needed / args.frequency  # Use configurable robot frequency
     total_sim_frames = int(total_sim_time * aec_env.simulation_frequency)
 
     logger.info(f"Running {total_sim_frames} simulation frames ({total_sim_time:.1f}s)")
@@ -701,7 +731,7 @@ def main():
     if args.enable_camera:
         logger.info("📹 Periodic recording completed automatically")
 
-    logger.info("🎉 Go1 MARL Training finished!")
+    logger.info(f"🎉 {args.robot.upper()} MARL Training finished!")
 
     return True
 
@@ -709,8 +739,8 @@ def main():
 if __name__ == "__main__":
     success = main()
     if success:
-        print("\n🎉 Go1 MARL training completed successfully!")
+        print("\n🎉 MARL training completed successfully!")
         exit(0)
     else:
-        print("\n❌ Go1 MARL training failed!")
+        print("\n❌ MARL training failed!")
         exit(1)

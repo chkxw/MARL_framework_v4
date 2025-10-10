@@ -44,6 +44,22 @@ from configs.CameraConfig import CameraConfig
 # Setup logging
 logger = get_class_logger("TrainingScript", "dual_go2_element_push_mappo", level="INFO")
 
+# ========================= Helper Functions =========================
+
+def compute_orientation_difference(quat1: torch.Tensor, quat2: torch.Tensor) -> torch.Tensor:
+    """Compute angular difference between two quaternions in radians.
+
+    Args:
+        quat1, quat2: Quaternion tensors [N, 4] in format [w, x, y, z]
+
+    Returns:
+        Angular difference in radians [N], range [0, π]
+    """
+    quat_dot = torch.abs(torch.sum(quat1 * quat2, dim=1))
+    quat_dot = torch.clamp(quat_dot, 0.0, 1.0)
+    angular_diff = 2.0 * torch.acos(quat_dot)
+    return angular_diff
+
 # ========================= Configuration Classes =========================
 @dataclass
 class ElementConfig(ABC):
@@ -157,9 +173,10 @@ def create_element_config(object_type: str) -> ElementConfig:
             height=0.4
         ),
         "box": BoxConfig(
-            mass=3.0,
+            mass=5.0,
             friction=0.5,
             spawn_pos=[0.0, 0.0],
+            # size=[0.5, 0.5, 0.5]
             size=[0.7620, 0.4674, 0.4674]
         ),
         "tblock": TBlockConfig(
@@ -237,24 +254,28 @@ class RobotControlConfig:
 @dataclass
 class TaskConfig:
     """Configuration for task-specific parameters."""
-    
+
     goal_distance: float = 2.0
-    goal_tolerance: float = 0.3
+    goal_tolerance: float = 0.3                # Position tolerance (meters)
+    orientation_tolerance: float = 0.26        # Orientation tolerance (~15 degrees in radians)
     far_from_goal_tolerance:float = 10.0
     goal_height: float = 0.1
     goal_marker_size: float = 0.1
-    
+
     def validate(self) -> None:
         """Validate task configuration."""
         if self.goal_distance <= 0:
             raise ValueError(f"Goal distance must be positive, got {self.goal_distance}")
-        
+
         if self.goal_tolerance <= 0:
             raise ValueError(f"Goal tolerance must be positive, got {self.goal_tolerance}")
-        
+
+        if self.orientation_tolerance <= 0:
+            raise ValueError(f"Orientation tolerance must be positive, got {self.orientation_tolerance}")
+
         if self.goal_height < 0:
             raise ValueError(f"Goal height must be non-negative, got {self.goal_height}")
-        
+
         if self.goal_marker_size <= 0:
             raise ValueError(f"Goal marker size must be positive, got {self.goal_marker_size}")
 
@@ -262,8 +283,8 @@ class TaskConfig:
 @dataclass
 class ObservationConfig:
     """Configuration for observation space."""
-    
-    num_obs: int = 47
+
+    num_obs: int = 23  # 5D proprioceptive + 8D positions + 6D orientations + 3D action + 1D id
     obs_scales: Dict[str, float] = field(default_factory=lambda: {
         "lin_vel": 2.0,
         "ang_vel": 0.25,
@@ -285,16 +306,17 @@ class RewardConfig:
     # MAPush reward scales
     target_reward_scale: float = 0.00325
     approach_reward_scale: float = 0.00075
-    collision_punishment_scale: float = -0.0015
     push_reward_scale: float = 0.0015
     ocb_reward_scale: float = 0.004
+    orientation_reward_scale: float = 0.005
     reach_target_reward_scale: float = 10.0
     too_far_punishment_scale: float = -5.0
-    exception_punishment_scale: float = -5.0
+    exception_punishment_scale: float = -0.5
     
     # Object-specific collision scales
     collision_scale_cylinder: float = -0.0015
-    collision_scale_box: float = -0.0025
+    collision_scale_box: float = -0.0005
+    # collision_scale_box: float = -0.005
     collision_scale_tblock: float = -0.0025
     
     def validate(self) -> None:
@@ -316,8 +338,8 @@ class RewardConfig:
             raise ValueError(f"Reach target reward scale should be positive, got {self.reach_target_reward_scale}")
         
         # Negative rewards should be negative
-        if self.collision_punishment_scale > 0:
-            raise ValueError(f"Collision punishment scale should be negative, got {self.collision_punishment_scale}")
+        if self.collision_scale_cylinder > 0:
+            raise ValueError(f"Collision punishment scale should be negative, got {self.collision_scale_cylinder}")
         
         if self.exception_punishment_scale > 0:
             raise ValueError(f"Exception punishment scale should be negative, got {self.exception_punishment_scale}")
@@ -398,6 +420,7 @@ class MAPushConfig:
             "clip_actions": self.robot_control.clip_actions,
             "goal_distance": self.task.goal_distance,
             "goal_tolerance": self.task.goal_tolerance,
+            "orientation_tolerance": self.task.orientation_tolerance,
             "far_from_goal_tolerance": self.task.far_from_goal_tolerance,
             "goal_height": self.task.goal_height,
             "goal_marker_size": self.task.goal_marker_size,
@@ -433,9 +456,9 @@ class MAPushConfig:
         reward_cfg = {
             "target_reward_scale": self.reward.target_reward_scale,
             "approach_reward_scale": self.reward.approach_reward_scale,
-            "collision_punishment_scale": self.reward.collision_punishment_scale,
             "push_reward_scale": self.reward.push_reward_scale,
             "ocb_reward_scale": self.reward.ocb_reward_scale,
+            "orientation_reward_scale": self.reward.orientation_reward_scale,
             "reach_target_reward_scale": self.reward.reach_target_reward_scale,
             "too_far_punishment_scale" : self.reward.too_far_punishment_scale,
             "exception_punishment_scale": self.reward.exception_punishment_scale,
@@ -618,22 +641,25 @@ def generate_tblock_mesh(horizontal_size, vertical_size, save_path="meshes/tbloc
 
 
 def mapush_obs_function(robot_name: str, env: VectorizedAECEnv) -> torch.Tensor:
-    """MAPush observation function for MAPPO training.
-    
-    Computes 47D observation vector following MAPush paper specifications:
-    - Proprioceptive state (33D): base angular velocity, projected gravity, command velocities,
-      joint positions relative to default, joint velocities, previous joint actions
-    - Task observations (10D): base linear velocity, element position, other robot position,
-      goal from robot, goal from element
+    """MAPush observation function for MAPPO training with orientation target.
+
+    Computes 23D observation vector for collaborative pushing task:
+    - Proprioceptive state (5D): base linear velocity (2D), base angular velocity (3D)
+    - Task positions (8D): element relative position (2D), other robot relative position (2D),
+      goal from robot (2D), goal from element (2D)
+    - Orientation information (6D): element error sin/cos (2D), robot-to-target sin/cos (2D),
+      robot-to-element sin/cos (2D)
     - Action history (3D): Previous high-level velocity commands
-    - Robot index (1D): For multi-agent distinction
-    
+    - Agent identification (1D): Robot index for multi-agent distinction
+
+    Note: Projected gravity, joint positions, and joint velocities are excluded for stability.
+
     Args:
         robot_name: Name of the robot ("go2_robot_1" or "go2_robot_2")
         env: VectorizedAECEnv instance
-        
+
     Returns:
-        torch.Tensor: 47D observation tensor for the robot [n_envs, 47]
+        torch.Tensor: 23D observation tensor for the robot [n_envs, 23]
     """
     # Get configs from training config
     training_config = env.training_configs[env.robot_2_training_name[robot_name]]
@@ -788,7 +814,42 @@ def mapush_obs_function(robot_name: str, env: VectorizedAECEnv) -> torch.Tensor:
     
     # 11. Goal position from element in world frame (2D)
     goal_from_element = goal_pos - element_pos
-    
+
+    # ============================================
+    # ORIENTATION OBSERVATIONS (6D)
+    # ============================================
+
+    # Get orientations
+    robot_quat = base_quat  # Already computed above
+    element_quat = env.element.get_orientation(format="quat")
+    target_quat = env.target_element_orientation
+
+    # Extract yaw angles using existing quat_to_xyz utility
+    robot_yaw = quat_to_xyz(robot_quat, rpy=True, degrees=False)[:, 2]  # Yaw is 3rd component
+    element_yaw = quat_to_xyz(element_quat, rpy=True, degrees=False)[:, 2]
+    target_yaw = quat_to_xyz(target_quat, rpy=True, degrees=False)[:, 2]
+
+    # 12. Element orientation error (target - current element) [2D]
+    element_yaw_diff = target_yaw - element_yaw
+    element_orientation_error = torch.stack([
+        torch.sin(element_yaw_diff),
+        torch.cos(element_yaw_diff)
+    ], dim=1)
+
+    # 13. Robot to target element orientation [2D]
+    robot_to_target_diff = target_yaw - robot_yaw
+    robot_to_target_orientation = torch.stack([
+        torch.sin(robot_to_target_diff),
+        torch.cos(robot_to_target_diff)
+    ], dim=1)
+
+    # 14. Robot to current element orientation [2D]
+    robot_to_element_diff = element_yaw - robot_yaw
+    robot_to_element_orientation = torch.stack([
+        torch.sin(robot_to_element_diff),
+        torch.cos(robot_to_element_diff)
+    ], dim=1)
+
     # ============================================
     # ACTION HISTORY (3D)
     # ============================================
@@ -810,27 +871,32 @@ def mapush_obs_function(robot_name: str, env: VectorizedAECEnv) -> torch.Tensor:
     robot_idx_tensor = torch.full((n_envs, 1), float(robot_idx), device=device, dtype=torch.float32)
     
     # ============================================
-    # COMBINE ALL OBSERVATIONS (47D total)
+    # COMBINE ALL OBSERVATIONS (23D total)
     # ============================================
-    
-    obs = torch.cat([
-        base_lin_vel_scaled,         # 2D
-        base_ang_vel_scaled,          # 3D
-        # Task-specific (10D)
-        element_direction_robot_frame,# 2D
-        other_robot_direction_robot_frame,  # 2D
-        goal_from_robot_frame,        # 2D
-        goal_from_element,            # 2D
-        # Action history (3D)
-        previous_action,              # 3D
-        # Agent identification (1D)
-        robot_idx_tensor,             # 1D
 
-        # For stability 
-        projected_gravity,           # 3D
-        joint_pos_scaled,            # 12D
-        joint_vel_scaled,            # 12D
-    ], dim=1)  # Total: 33 + 10 + 3 + 1 = 47D
+    obs = torch.cat([
+        # Proprioceptive (5D)
+        base_lin_vel_scaled,                   # 2D
+        base_ang_vel_scaled,                    # 3D
+        # Task-specific positions (8D)
+        element_direction_robot_frame,          # 2D
+        other_robot_direction_robot_frame,      # 2D
+        goal_from_robot_frame,                  # 2D
+        goal_from_element,                      # 2D
+        # Orientation information (6D)
+        element_orientation_error,              # 2D
+        robot_to_target_orientation,            # 2D
+        robot_to_element_orientation,           # 2D
+        # Action history (3D)
+        previous_action,                        # 3D
+        # Agent identification (1D)
+        robot_idx_tensor,                       # 1D
+
+        # For stability (excluded from final obs)
+        # projected_gravity,                    # 3D
+        # joint_pos_scaled,                     # 12D
+        # joint_vel_scaled,                     # 12D
+    ], dim=1) 
     
     # ============================================
     # CACHE LOCOMOTION INPUT (45D) for action preprocessing
@@ -934,20 +1000,21 @@ def mapush_obs_function(robot_name: str, env: VectorizedAECEnv) -> torch.Tensor:
 
 
 def mapush_reward_function(robot_name: str, env: VectorizedAECEnv) -> Dict[str, torch.Tensor]:
-    """MAPush reward function for MAPPO training.
-    
+    """MAPush reward function for MAPPO training with orientation target.
+
     Implements the complete MAPush reward structure including:
     1. Approach reward (distance to object)
     2. Push reward (object movement)
     3. Collision penalty (robot-robot contact)
-    4. Success bonus (goal reached)
+    4. Success bonus (goal reached with correct position AND orientation)
     5. Distance progress reward
     6. OCB (Object-centric behavior) reward
-    
+    7. Orientation alignment reward (align element to target orientation)
+
     Args:
         robot_name: Name of the robot ("go2_robot_1" or "go2_robot_2")
         env: VectorizedAECEnv instance
-        
+
     Returns:
         Dict[str, torch.Tensor]: Dictionary with robot_name as key and reward tensor as value
     """
@@ -1012,17 +1079,27 @@ def mapush_reward_function(robot_name: str, env: VectorizedAECEnv) -> Dict[str, 
         elif object_type == 'tblock':
             collision_scale = reward_cfg["collision_scale_tblock"]
         else:
-            collision_scale = reward_cfg["collision_punishment_scale"]
+            raise ValueError(f"Unknown object type: {object_type}")
         
         # Apply inverse distance penalty
         collision_penalty = (1.0 / (0.02 + robot_distance / 3.0)) * collision_scale
         reward += collision_penalty
     
     # ============================================
-    # 4. SUCCESS BONUS (goal reached)
+    # 4. SUCCESS BONUS (position + orientation at goal)
     # ============================================
+    # Position check
     distance_to_goal = torch.norm(element_xy - goal_pos, dim=1)
-    goal_reached = distance_to_goal < env_cfg["goal_tolerance"]
+    position_at_goal = distance_to_goal < env_cfg["goal_tolerance"]
+
+    # Orientation check
+    element_quat = env.element.get_orientation(format="quat")
+    target_quat = env.target_element_orientation
+    angular_diff = compute_orientation_difference(element_quat, target_quat)
+    orientation_at_goal = angular_diff < env_cfg["orientation_tolerance"]
+
+    # Success bonus only when both criteria met
+    goal_reached = position_at_goal & orientation_at_goal
     success_bonus = goal_reached.float() * reward_cfg["reach_target_reward_scale"]
     reward += success_bonus
 
@@ -1068,14 +1145,41 @@ def mapush_reward_function(robot_name: str, env: VectorizedAECEnv) -> Dict[str, 
     ocb_reward = torch.zeros(n_envs, device=device)
     ocb_reward[element_speed > 0.1] = alignment[element_speed > 0.1] * reward_cfg["ocb_reward_scale"]
     reward += ocb_reward
-    
+
     # ============================================
-    # 8. EXCEPTION PUNISHMENT (for invalid states)
+    # 8. ORIENTATION ALIGNMENT REWARD (keep orientation within ±90° of target)
+    # ============================================
+    # Get current element orientation
+    element_quat = env.element.get_orientation(format="quat")
+    target_quat = env.target_element_orientation
+
+    # Calculate angular difference using quaternion dot product
+    # For quaternions q1 and q2, angle θ = 2 * arccos(|q1 · q2|)
+    quat_dot = torch.abs(torch.sum(element_quat * target_quat, dim=1))
+    quat_dot = torch.clamp(quat_dot, 0.0, 1.0)  # Clamp for numerical stability
+    angular_diff = 2.0 * torch.acos(quat_dot)  # In radians
+
+    # Normalize to [0, 1] where 0° = 1.0 and 90° = 0.0
+    # Angular diff ranges from 0 to π, we want to reward when diff < π/2 (90°)
+    orientation_alignment = torch.clamp(1.0 - (angular_diff / (torch.pi / 2)), 0.0, 1.0)
+
+    # Apply reward only when within ±90° (orientation_alignment > 0)
+    orientation_reward = orientation_alignment * reward_cfg["orientation_reward_scale"]
+    reward += orientation_reward
+
+    # ============================================
+    # 9. EXCEPTION PUNISHMENT (for invalid states)
     # ============================================
     # Check for NaN or Inf values
-    has_nan = torch.isnan(reward) | torch.isinf(reward)
-    if has_nan.any():
-        reward[has_nan] = reward_cfg["exception_punishment_scale"]
+    problematic_obs_mask = env.problematic_obs[robot_name]
+    has_nan_in_reward = torch.isnan(reward) | torch.isinf(reward)
+    all_problemetics = has_nan_in_reward | problematic_obs_mask
+
+    exception_punishment= torch.zeros(n_envs, device=device)
+    exception_punishment[all_problemetics] = reward_cfg["exception_punishment_scale"]
+
+    reward[all_problemetics] = reward_cfg["exception_punishment_scale"]
+    
     
     # ============================================
     # TENSORBOARD LOGGING
@@ -1092,8 +1196,10 @@ def mapush_reward_function(robot_name: str, env: VectorizedAECEnv) -> Dict[str, 
         env.infos[robot_name]["tensorboard/collision_penalty"] = collision_penalty.mean()
     env.infos[robot_name]["tensorboard/reach_target_reward"] = success_bonus.mean()
     env.infos[robot_name]["tensorboard/too_far_punishment"] = too_far_punishment.mean()
+    env.infos[robot_name]["tensorboard/exception_punishment"] = exception_punishment.mean()
     env.infos[robot_name]["tensorboard/distance_to_target_reward"] = distance_reward.mean()
     env.infos[robot_name]["tensorboard/ocb_reward"] = ocb_reward.mean()
+    env.infos[robot_name]["tensorboard/orientation_reward"] = orientation_reward.mean()
     env.infos[robot_name]["tensorboard/total_reward"] = reward.mean()
     
     # Return reward dictionary
@@ -1582,11 +1688,24 @@ def go2_truncation_function(robot_name: str, env: VectorizedAECEnv) -> torch.Ten
         if other_name in env.dead_robots:
             other_robot_dead = other_robot_dead | env.dead_robots[other_name]
 
-    # Check if element reached goal
-    element_pos = env.element.get_pos()[:, :2]  # Get element position from simulator
-    goal_pos = env.goal_position  # 2D position (static goal)
+    # ============================================
+    # SUCCESS CRITERIA: Position + Orientation
+    # ============================================
+    element_pos = env.element.get_pos()[:, :2]
+    goal_pos = env.goal_position
+
+    # Position check
     element_to_goal_distance = torch.norm(element_pos - goal_pos, dim=1)
-    goal_reached = element_to_goal_distance < env_cfg["goal_tolerance"]
+    position_reached = element_to_goal_distance < env_cfg["goal_tolerance"]
+
+    # Orientation check
+    element_quat = env.element.get_orientation(format="quat")
+    target_quat = env.target_element_orientation
+    angular_diff = compute_orientation_difference(element_quat, target_quat)
+    orientation_reached = angular_diff < env_cfg["orientation_tolerance"]
+
+    # Both conditions must be satisfied
+    goal_reached = position_reached & orientation_reached
     
     # Check for problematic observations (early truncate environments with NaN/Inf/large values)
     problematic_truncate = torch.zeros(env.n_envs, device=env.device, dtype=torch.bool)
@@ -1835,10 +1954,27 @@ def training_post_reset_hook(training_name, env: VectorizedAECEnv, env_indices):
     )
     env.element.set_pos(element_pos_3d, env_indices=env_indices)
     
-    # Reset orientation to initial upright position (identity quaternion: w=1, x=0, y=0, z=0)
+    # Generate random initial orientation between 0° and -90°
+    initial_yaw = torch.rand(len(env_indices), device=env.device) * (-torch.pi / 2)  # [0, -π/2]
+
+    # Convert initial yaw to quaternion (rotation around z-axis)
+    # quat = [w, x, y, z] = [cos(θ/2), 0, 0, sin(θ/2)]
     initial_quat = torch.zeros((len(env_indices), 4), device=env.device, dtype=torch.float32)
-    initial_quat[:] = torch.tensor([0.923880, 0.000000, 0.000000, -0.382683], device=env.device, dtype=torch.float32) # hard code -45 degree
+    initial_quat[:, 0] = torch.cos(initial_yaw / 2)  # w
+    initial_quat[:, 3] = torch.sin(initial_yaw / 2)  # z
     env.element.set_orientation(initial_quat, format="quat", env_indices=env_indices)
+
+    # Generate target orientation within ±90° of initial orientation
+    offset_angle = (torch.rand(len(env_indices), device=env.device) * torch.pi) - (torch.pi / 2)  # [-π/2, +π/2]
+    target_yaw = initial_yaw + offset_angle
+
+    # Convert target yaw to quaternion
+    target_quat = torch.zeros((len(env_indices), 4), device=env.device, dtype=torch.float32)
+    target_quat[:, 0] = torch.cos(target_yaw / 2)  # w
+    target_quat[:, 3] = torch.sin(target_yaw / 2)  # z
+
+    # Store target orientation for reward calculation
+    env.target_element_orientation[env_indices] = target_quat
     
     env.element.set_lin_vel(
         torch.zeros((len(env_indices), 3), device=env.device, dtype=torch.float32), env_indices=env_indices
@@ -2035,7 +2171,17 @@ def training_pre_build_hook(training_name, env):
             clear_in_reset=True,
             clear_after_use=False,
         )
-    
+
+    if not hasattr(env, 'target_element_orientation'):
+        env.register_tensor_field(
+            'target_element_orientation',
+            torch.zeros((4,), device=env.device, dtype=torch.float32),
+            per_robot=False,
+            per_env=True,
+            clear_in_reset=True,
+            clear_after_use=False,
+        )
+
     # Register locomotion input cache to avoid redundant computations
     if not hasattr(env, 'locomotion_input_cache'):
         env.register_tensor_field(

@@ -1,0 +1,24 @@
+name: genesis
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12.11
+  - pip
+  - setuptools=78.1.1
+  - wheel=0.45.1
+  - pip:
+      - torch==2.8.0
+      - torchvision==0.23.0
+      - onnx
+      - onnxruntime-gpu
+      - openrl
+      - rsl-rl-lib==2.2.4
+      - pettingzoo==1.23
+      - gymnasium==0.29.1
+      - numpy==2.2.6
+      - tensorboard
+      - tensorboardx
+      # install genesis from github
+      - git+https://github.com/Genesis-Embodied-AI/Genesis.git
+
